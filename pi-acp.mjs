@@ -104,9 +104,15 @@ async function getModelRuntime() {
  * `value` is "provider/modelId" — the same string Buzz sends back in set_model.
  */
 function buildModelOptions(runtime) {
-	// Models that are broken or out of quota — never surface them so Buzz
+	// Models that are broken or out of quota — never surface them so the host
 	// can't select them and the session default never lands on one.
-	const BLOCKED = new Set(["kimi-coding/k3"]);
+	// Configure via env var PI_ACP_BLOCKED_MODELS="provider/model,provider/model"
+	const BLOCKED = new Set(
+		(process.env.PI_ACP_BLOCKED_MODELS || "")
+					.split(",")
+					.map((s) => s.trim())
+					.filter(Boolean),
+	);
 	const options = [];
 	const byValue = new Map();
 	for (const provider of runtime.getProviders()) {
@@ -181,7 +187,7 @@ async function newPiSession(sessionId, { cwd, systemPrompt } = {}) {
 
 	const models = buildModelOptions(runtime);
 	// Don't let the session start on a broken/blocked model. If pi's default
-	// (e.g. kimi-coding/k3, out of quota) isn't in our surfaced list, switch
+	// isn't in our surfaced list (blocked via env, or unconfigured), switch
 	// to the first available working model before any prompt runs.
 	const cur = session.model;
 	if (cur && !models.byValue.has(`${cur.provider}/${cur.id}`) && models.options.length > 0) {

@@ -85,6 +85,11 @@ printf '%s\n' \
 
 **Model picker.** The adapter surfaces pi's configured models as ACP `configOptions` so Buzz's dropdown is live. When Buzz picks one (via `session/set_config_option` with `configId="model"`), the adapter actually applies it.
 
+**Blocked models.** Set `PI_ACP_BLOCKED_MODELS` to hide broken/out-of-quota models from the picker (comma-separated `provider/model` IDs):
+```bash
+PI_ACP_BLOCKED_MODELS="kimi-coding/k3,zai/glm-5.2" node pi-acp.mjs
+```
+
 **Resilience.**
 - **Inactivity watchdog** — if a prompt produces no events (text / tool / retry) for 5 minutes, the model is stuck; the adapter aborts and surfaces a message.
 - **Auto-retry** — transient model errors self-heal; each retry is surfaced so the UI never looks frozen.
@@ -182,6 +187,11 @@ printf '%s\n' \
 **System prompt 转发。** Buzz 在 `session/new` 里把它的基础 prompt + 人设作为 `systemPrompt` 发来。适配器通过 `DefaultResourceLoader({ appendSystemPrompt })` 把它追加到 pi 自己的 system prompt 后面，这样 pi 既保留全部工具文档 / 技能 / 当前目录上下文，**又**获得了 Buzz 的协作规则（@提及、回调、记忆纪律）。
 
 **模型选择器。** 适配器把 pi 已配置的模型作为 ACP `configOptions` 暴露出来，Buzz 的下拉菜单就活了。Buzz 选一个（通过 `session/set_config_option`，`configId="model"`）后，适配器真正应用它。
+
+**屏蔽模型。** 设置 `PI_ACP_BLOCKED_MODELS` 可以把坏掉/欠费的模型从选择器里隐藏（逗号分隔的 `provider/model` ID）：
+```bash
+PI_ACP_BLOCKED_MODELS="kimi-coding/k3,zai/glm-5.2" node pi-acp.mjs
+```
 
 **健壮性。**
 - **不活动看门狗**——如果一个 prompt 连续 5 分钟没有任何事件（文本 / 工具 / 重试），说明模型卡死了；适配器自动 abort 并发出一条可见消息。
