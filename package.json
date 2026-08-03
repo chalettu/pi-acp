@@ -2,7 +2,7 @@
   "name": "pi-acp",
   "version": "0.1.0",
   "description": "ACP adapter that lets Buzz drive the pi coding agent as a managed agent — like claude-agent-acp wraps Claude Code.",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "pi-acp": "./pi-acp.mjs"
