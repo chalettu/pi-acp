@@ -104,15 +104,6 @@ async function getModelRuntime() {
  * `value` is "provider/modelId" — the same string Buzz sends back in set_model.
  */
 function buildModelOptions(runtime) {
-	// Models that are broken or out of quota — never surface them so the host
-	// can't select them and the session default never lands on one.
-	// Configure via env var PI_ACP_BLOCKED_MODELS="provider/model,provider/model"
-	const BLOCKED = new Set(
-		(process.env.PI_ACP_BLOCKED_MODELS || "")
-					.split(",")
-					.map((s) => s.trim())
-					.filter(Boolean),
-	);
 	const options = [];
 	const byValue = new Map();
 	for (const provider of runtime.getProviders()) {
@@ -121,7 +112,6 @@ function buildModelOptions(runtime) {
 		for (const m of runtime.getModels(pid)) {
 			const value = `${pid}/${m.id}`;
 			if (byValue.has(value)) continue;
-			if (BLOCKED.has(value)) continue;
 			const label = m.name || m.apiName || m.displayName || m.id;
 			options.push({ value, label });
 			byValue.set(value, m);
@@ -186,9 +176,9 @@ async function newPiSession(sessionId, { cwd, systemPrompt } = {}) {
 	const session = created.session;
 
 	const models = buildModelOptions(runtime);
-	// Don't let the session start on a broken/blocked model. If pi's default
-	// isn't in our surfaced list (blocked via env, or unconfigured), switch
-	// to the first available working model before any prompt runs.
+	// If pi's default model isn't in our surfaced list (e.g. its provider has
+	// no configured auth), switch to the first available model before any
+	// prompt runs, so the session never starts on an unusable model.
 	const cur = session.model;
 	if (cur && !models.byValue.has(`${cur.provider}/${cur.id}`) && models.options.length > 0) {
 		const fallback = models.byValue.get(models.options[0].value);
