@@ -1,0 +1,9 @@
+{
+  "id": "pi",
+  "label": "pi",
+  "command": "node",
+  "args": ["<PATH-TO-PI-ACP>/pi-acp.mjs"],
+  "env": {},
+  "install_instructions_url": "",
+  "install_hint": "Run: cd <PATH-TO-PI-ACP> && npm install"
+}
