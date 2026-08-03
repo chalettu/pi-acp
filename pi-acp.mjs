@@ -199,7 +199,8 @@ async function newPiSession(sessionId, { cwd, systemPrompt } = {}) {
 	} catch (e) {
 		log("could not enable auto-retry:", e?.message || e);
 	}
-	const entry = { session, cancelled: false, promptId: null, models, producedText: false, lastActivity: 0, watchdog: null };
+	const entry = { session, cancelled: false, promptId: null, models, producedText: false, lastActivity: 0, watchdog: null,
+		_systemPrompt: systemPrompt, _cwd: cwd || process.cwd() };
 	const unsubscribe = session.subscribe((event) => {
 		try {
 			handlePiEvent(sessionId, entry, event);
@@ -279,6 +280,22 @@ function handlePiEvent(sessionId, entry, event) {
 			if (event.result != null) upd.result = event.result;
 			sessionUpdate(sessionId, upd);
 		}
+	} else if (type === "compaction_start") {
+		// pi is summarizing — surface progress so the UI doesn't look frozen
+		// during the LLM call that generates the summary.
+		entry.producedText = true;
+		sessionUpdate(sessionId, {
+			sessionUpdate: "agent_message_chunk",
+			content: { text: "\n\n📦 Compacting context…" },
+		});
+	} else if (type === "compaction_end") {
+		if (event.aborted || event.errorMessage) {
+			sessionUpdate(sessionId, {
+				sessionUpdate: "agent_message_chunk",
+				content: { text: `\n\n⚠️ Compaction ${event.aborted ? "aborted" : "failed"}${event.errorMessage ? ": " + event.errorMessage : ""}` },
+			});
+		}
+		// Success case is handled by the /compact interceptor's own response.
 	} else if (type === "auto_retry_start") {
 		// Model errored and pi is retrying with backoff. auto_retry_* events are
 		// part of the subscribe stream, so surface them — otherwise the UI shows
@@ -376,14 +393,93 @@ async function handleMessage(msg) {
 			if (!entry) return fail(id, -32602, `unknown sessionId: ${sessionId}`);
 
 			const blocks = Array.isArray(params?.prompt) ? params.prompt : [];
-			const text = blocks
+			const allText = blocks
 				.filter((b) => b?.type === "text" && typeof b.text === "string")
 				.map((b) => b.text)
 				.join("\n\n");
 
+			// Buzz's slash-command pass-through sends the bare command as the first
+			// prompt block, then the wrapped Buzz context as subsequent blocks.
+			// Check the FIRST block for a slash command — the full joined text
+			// includes context so it would never match "/compact" exactly.
+			const firstBlockText = blocks
+				.filter((b) => b?.type === "text" && typeof b.text === "string")
+				.map((b) => b.text)[0] ?? "";
+			const firstLine = firstBlockText.trim();
+			const text = allText; // keep for the normal prompt path below
+
 			entry.cancelled = false;
 			entry.promptId = id;
 			entry.producedText = false;
+
+			// ── Slash command interception ────────────────────────────────────
+			// pi-acp sits between Buzz and the pi SDK. Buzz sends slash commands
+			// (from the composer toolbar) as prompt text with a "/" prefix. The pi
+			// SDK's interactive mode handles these natively, but session.prompt()
+			// does NOT — it forwards raw text to the model. Intercept here so
+			// /compact and /reset are handled locally, matching pi's own CLI.
+			if (firstLine === "/compact" || firstLine.startsWith("/compact ")) {
+				const customInstructions = firstLine.startsWith("/compact ")
+					? firstLine.slice(9).trim() || undefined
+					: undefined;
+				armWatchdog(sessionId, entry);
+				try {
+					const result = await entry.session.compact(customInstructions);
+					clearWatchdog(entry);
+					const before = result?.tokensBefore ?? "?";
+					const after = result?.estimatedTokensAfter ?? "?";
+					sessionUpdate(sessionId, {
+						sessionUpdate: "agent_message_chunk",
+						content: {
+							text: `\n\n📦 Context compacted: ${before} → ${after} tokens.`,
+						},
+					});
+					entry.promptId = null;
+					return ok(id, { stopReason: "end_turn" });
+				} catch (e) {
+					clearWatchdog(entry);
+					entry.promptId = null;
+					log("compact failed:", e?.stack || e);
+					sessionUpdate(sessionId, {
+						sessionUpdate: "agent_message_chunk",
+						content: { text: `\n\n❌ Compaction failed: ${e?.message || e}` },
+					});
+					return ok(id, { stopReason: "end_turn" });
+				}
+			}
+			if (firstLine === "/reset") {
+				// pi's AgentSession has no clear() method — the interactive CLI's
+				// /reset wipes in-memory history. In ACP we must keep the same
+				// session id, so dispose the current pi session and create a new
+				// one in its place. The Buzz-side session id stays stable.
+				try {
+					entry.unsubscribe?.();
+					entry.session.dispose();
+				} catch (e) {
+					log("/reset dispose failed:", e?.message);
+				}
+				try {
+					const sysPrompt = entry._systemPrompt;
+					const newEntry = await newPiSession(sessionId, {
+						cwd: entry._cwd,
+						systemPrompt: sysPrompt,
+					});
+					// newPiSession already sets sessions.set(sessionId, newEntry)
+				} catch (e) {
+					log("/reset re-create failed:", e?.stack || e);
+					sessionUpdate(sessionId, {
+						sessionUpdate: "agent_message_chunk",
+						content: { text: `\n\n❌ Reset failed: ${e?.message || e}` },
+					});
+				}
+				sessionUpdate(sessionId, {
+					sessionUpdate: "agent_message_chunk",
+					content: { text: "\n\n🗑️ Conversation history cleared." },
+				});
+				entry.promptId = null;
+				return ok(id, { stopReason: "end_turn" });
+			}
+
 			armWatchdog(sessionId, entry);
 			try {
 				await entry.session.prompt(text);
