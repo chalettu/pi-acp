@@ -68,12 +68,18 @@ npm run test:e2e   # 完整：模型列表、systemPrompt 转发、工具调用�
 
 | ACP 方法 | 行为 |
 |---|---|
-| `initialize` | 握手；声明不支持 steering 扩展。 |
-| `session/new` | 创建 pi session；返回 `sessionId` + `configOptions`（pi 的模型列表）+ `models.default`。 |
+| `initialize` | 握手并返回 pi 身份/能力；声明不支持 steering 或 MCP transport。 |
+| `session/new` | 创建 pi session；以 ACP 的 config/state 两种格式返回当前模型和模型列表，并返回 Pi 的思考等级配置。 |
 | `session/prompt` | 执行 prompt；流式发送 `agent_message_chunk` + `agent_thought_chunk` + `tool_call` + `tool_call_update`；返回 `stopReason`。 |
 | `session/cancel` | 调用 `session.abort()`；返回 `stopReason: "cancelled"`。 |
 | `session/set_model` | 解析并应用模型。 |
-| `session/set_config_option` | 当 `configId="model"` 时应用模型（Buzz 走的路径）。 |
+| `session/set_config_option` | 应用 `model` 和 `thinking`/`effort` 配置。 |
+
+### MCP 状态
+
+Pi 没有内置 MCP client。适配器会明确声明不支持 MCP transport，并在
+`session/new` 收到 `mcpServers` 时记录日志；它**不会**把这些 server 误称为
+模型可用。MCP bridge 需要单独实现。
 
 ## 架构
 

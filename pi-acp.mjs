@@ -23,6 +23,7 @@
  */
 
 import readline from "node:readline";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	createAgentSession,
@@ -48,6 +49,18 @@ const sessionUpdate = (sessionId, update) =>
 // call is stuck (hung connection, dead provider). Legit long tasks emit events
 // continuously, so total silence means genuinely unresponsive — abort it.
 const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+const THINKING_LEVELS = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+];
+const ADAPTER_VERSION = JSON.parse(
+	readFileSync(new URL("./package.json", import.meta.url), "utf8"),
+).version;
 
 function armWatchdog(sessionId, entry) {
 	clearWatchdog(entry);
@@ -100,7 +113,7 @@ async function getModelRuntime() {
 /**
  * Build the ACP `configOptions` model list from pi's ModelRuntime, filtered to
  * providers with configured auth so the picker only offers usable models.
- * Returns { options: [{value,label}], byValue: Map<value, Model> }.
+ * Returns { options: [{value,displayName}], byValue: Map<value, Model> }.
  * `value` is "provider/modelId" — the same string Buzz sends back in set_model.
  */
 function buildModelOptions(runtime) {
@@ -112,12 +125,54 @@ function buildModelOptions(runtime) {
 		for (const m of runtime.getModels(pid)) {
 			const value = `${pid}/${m.id}`;
 			if (byValue.has(value)) continue;
-			const label = m.name || m.apiName || m.displayName || m.id;
-			options.push({ value, label });
+			const displayName = m.name || m.apiName || m.displayName || m.id;
+			// `displayName` is the ACP spelling. Retain `label` for older hosts.
+			options.push({ value, displayName, label: displayName });
 			byValue.set(value, m);
 		}
 	}
 	return { options, byValue };
+}
+
+/** Build a configOption with both ACP and legacy Buzz field spellings. */
+function configOption({ configId, category, displayName, currentValue, options }) {
+	return {
+		configId,
+		category,
+		displayName,
+		label: displayName,
+		currentValue,
+		// Buzz's profile cache also accepts `value`; emitting both keeps the
+		// selected option visible across ACP client versions.
+		value: currentValue,
+		options,
+	};
+}
+
+function buildThinkingOption(session) {
+	const currentValue = session.thinkingLevel || "off";
+	return configOption({
+		configId: "thinking",
+		category: "effort",
+		displayName: "Thinking / Effort",
+		currentValue,
+		options: THINKING_LEVELS.map((value) => ({
+			value,
+			displayName: value,
+			label: value,
+		})),
+	});
+}
+
+/** ACP's unstable model-state shape, used by Buzz to cache the active model. */
+function buildModelState(entry) {
+	return {
+		currentModelId: currentValue(entry),
+		availableModels: entry.models.options.map((option) => ({
+			modelId: option.value,
+			name: option.displayName,
+		})),
+	};
 }
 
 /** Resolve any modelId string Buzz might send back to a Model object. */
@@ -146,7 +201,7 @@ function resolveModel(entry, modelId) {
  * pi's own system prompt via DefaultResourceLoader.appendSystemPrompt, so pi
  * keeps all its tool docs / skills / context AND gains Buzz's rules.
  */
-async function newPiSession(sessionId, { cwd, systemPrompt } = {}) {
+async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 	for (const [, s] of sessions) {
 		try {
 			s.unsubscribe?.();
@@ -157,6 +212,11 @@ async function newPiSession(sessionId, { cwd, systemPrompt } = {}) {
 
 	const runtime = await getModelRuntime();
 	const agentDir = getAgentDir();
+	if (Array.isArray(mcpServers) && mcpServers.length > 0) {
+		// Pi intentionally has no built-in MCP client. Do not claim these servers
+		// are available to the model merely because an ACP host supplied them.
+		log("session/new: MCP servers supplied but unsupported by pi; ignoring", mcpServers.length);
+	}
 
 	// Append Buzz's system prompt (collaboration rules + persona) to pi's own.
 	const loader = new DefaultResourceLoader({
@@ -337,7 +397,14 @@ async function handleMessage(msg) {
 		);
 		return ok(id, {
 			protocolVersion: 2,
-			agentCapabilities: {},
+			agentCapabilities: {
+				loadSession: false,
+				promptCapabilities: { image: false, audio: false, embeddedContext: false },
+				// Pi has no built-in MCP transport. session/new therefore logs and
+				// ignores mcpServers rather than advertising unsupported capability.
+				mcpCapabilities: { http: false, sse: false },
+			},
+			agentInfo: { name: "pi", version: ADAPTER_VERSION },
 			_meta: { steering: { supported: false } },
 		});
 	}
@@ -353,19 +420,22 @@ async function handleMessage(msg) {
 			try {
 				const entry = await newPiSession(sessionId, params || {});
 				const cur = currentValue(entry);
-				const result = { sessionId };
-				// Surface pi's configured models so Buzz's model picker is live.
-				if (entry.models.options.length > 0) {
-					result.configOptions = [
-						{
+				const result = {
+					sessionId,
+					// Return the stable configOption and unstable SessionModelState
+					// forms. Buzz uses these to render and cache the active model.
+					configOptions: [
+						configOption({
 							configId: "model",
 							category: "model",
-							label: "Model",
+							displayName: "Model",
+							currentValue: cur,
 							options: entry.models.options,
-						},
-					];
-					if (cur) result.models = { default: cur };
-				}
+						}),
+						buildThinkingOption(entry.session),
+					],
+					models: buildModelState(entry),
+				};
 				log(
 					"session/new:",
 					sessionId,
@@ -545,29 +615,52 @@ async function handleMessage(msg) {
 		}
 
 		case "session/set_config_option": {
-			// buzz-acp sets the model via this stable path (configId="model"),
-			// NOT via session/set_model, once the adapter advertises configOptions.
-			// We must actually apply it or the session stays on the (possibly
-			// broken) default model and every prompt hangs.
+			// buzz-acp uses this stable path for configOptions, including model
+			// changes. Apply every option we advertise; never ACK a rejected value.
 			const sessionId = params?.sessionId;
 			const configId = params?.configId;
 			const cfgValue = params?.value;
 			log("set_config_option:", configId, "=", cfgValue);
 			const cfgEntry = sessions.get(sessionId);
-			if (cfgEntry && configId === "model" && cfgValue) {
+			if (!cfgEntry) {
+				return hasId
+					? fail(id, -32602, `unknown sessionId: ${sessionId}`)
+					: undefined;
+			}
+			if (typeof cfgValue !== "string" || !cfgValue) {
+				return hasId
+					? fail(id, -32602, `missing value for config option: ${configId}`)
+					: undefined;
+			}
+			if (configId === "model") {
 				const model = resolveModel(cfgEntry, cfgValue);
-				if (model) {
-					try {
-						await cfgEntry.session.setModel(model);
-						log("set_config_option: applied model", cfgValue);
-					} catch (e) {
-						log("set_config_option: setModel failed:", e?.message);
-					}
-				} else {
-					log("set_config_option: could not resolve model", cfgValue);
+				if (!model) {
+					return hasId ? fail(id, -32602, `unknown model: ${cfgValue}`) : undefined;
+				}
+				try {
+					await cfgEntry.session.setModel(model);
+					log("set_config_option: applied model", cfgValue);
+					return hasId ? ok(id, {}) : undefined;
+				} catch (e) {
+					log("set_config_option: setModel failed:", e?.message);
+					return hasId
+						? fail(id, -32603, `set_model failed: ${e?.message || e}`)
+						: undefined;
 				}
 			}
-			return hasId ? ok(id, {}) : undefined;
+			if (configId === "thinking" || configId === "effort") {
+				if (!THINKING_LEVELS.includes(cfgValue)) {
+					return hasId
+						? fail(id, -32602, `unsupported thinking level: ${cfgValue}`)
+						: undefined;
+				}
+				cfgEntry.session.setThinkingLevel(cfgValue);
+				log("set_config_option: applied thinking level", cfgValue);
+				return hasId ? ok(id, {}) : undefined;
+			}
+			return hasId
+				? fail(id, -32602, `unknown config option: ${configId}`)
+				: undefined;
 		}
 		case "authenticate":
 			return hasId ? ok(id, {}) : undefined;

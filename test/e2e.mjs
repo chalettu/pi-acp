@@ -34,12 +34,12 @@ rl.on("line", (line) => {
 	}
 	if (msg.method === "session/update") {
 		const u = msg.params?.update;
-		if (u?.type === "agent_message_chunk" && u.content?.text != null) {
+		if (u?.sessionUpdate === "agent_message_chunk" && u.content?.text != null) {
 			streamed += u.content.text;
 			process.stdout.write(u.content.text);
-		} else if (u?.type === "tool_call") {
+		} else if (u?.sessionUpdate === "tool_call") {
 			toolCalls++;
-			console.log(`\n[tool_call] ${u.title} ${u.content?.text ? "· " + u.content.text : ""}`);
+			console.log(`\n[tool_call] ${u.title}`);
 		}
 	}
 });
@@ -53,22 +53,40 @@ await send("initialize", {
 const created = await send("session/new", { cwd: "/tmp", systemPrompt: sysPrompt });
 sessionId = created.result.sessionId;
 
-// ① configOptions surfaced?
-const opts = created.result.configOptions?.[0]?.options ?? [];
-console.log(`① models surfaced: ${opts.length}`);
+// ① configOptions carry both the selectable models and the current model.
+const modelConfig = created.result.configOptions?.find((o) => o.category === "model");
+const opts = modelConfig?.options ?? [];
+const thinkingConfig = created.result.configOptions?.find((o) => o.category === "effort");
+const stateMatches =
+	modelConfig?.currentValue === created.result.models?.currentModelId &&
+	modelConfig?.value === modelConfig?.currentValue;
+console.log(`① models surfaced: ${opts.length}; current model state: ${stateMatches ? "PASS ✓" : "FAIL ✗"}`);
 if (opts.length) console.log("   sample:", opts.slice(0, 3).map((o) => o.value).join(", "));
+console.log(`   thinking config: ${thinkingConfig?.currentValue ? "PASS ✓" : "FAIL ✗"}`);
 
-// ③ set_model: switch to the first surfaced model, expect ok.
+// ③ Buzz selects a model through the stable configOptions path.
 let setOk = false;
-if (opts.length > 1) {
+if (opts.length > 0) {
 	const target = opts[0].value;
-	const sm = await send("session/set_model", { sessionId, modelId: target });
+	const sm = await send("session/set_config_option", {
+		sessionId,
+		configId: "model",
+		value: target,
+	});
 	setOk = !sm.error;
-	console.log(`③ set_model("${target}"): ${setOk ? "PASS ✓" : "FAIL ✗"}${sm.error ? " — " + sm.error.message : ""}`);
+	console.log(`③ set_config_option(model, "${target}"): ${setOk ? "PASS ✓" : "FAIL ✗"}${sm.error ? " — " + sm.error.message : ""}`);
 } else {
-	console.log("③ set_model: skipped (need ≥2 models)");
+	console.log("③ model selection: skipped (no authenticated models)");
 	setOk = true;
 }
+
+const effort = await send("session/set_config_option", {
+	sessionId,
+	configId: "thinking",
+	value: "medium",
+});
+const effortOk = !effort.error;
+console.log(`   set_config_option(thinking, "medium"): ${effortOk ? "PASS ✓" : "FAIL ✗"}`);
 
 // ② systemPrompt actually forwarded into pi? Ask for the secret marker.
 console.log("\n--- prompt: reveal secret marker ---");
@@ -94,4 +112,4 @@ console.log(`   stopReason: ${tdone.result?.stopReason}`);
 
 child.stdin.end();
 await new Promise((r) => child.on("exit", r));
-process.exit(ok && toolCalls > 0 ? 0 : 1);
+process.exit(ok && stateMatches && !!thinkingConfig?.currentValue && setOk && effortOk && toolCalls > 0 ? 0 : 1);

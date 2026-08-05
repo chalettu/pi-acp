@@ -69,12 +69,18 @@ npm run test:e2e   # full: model list, systemPrompt forwarding, tool surfacing
 
 | ACP method | Behavior |
 |---|---|
-| `initialize` | Handshake; advertises no steering extension. |
-| `session/new` | Creates a pi session; returns `sessionId` + `configOptions` (pi's models for the picker) + `models.default`. |
+| `initialize` | Handshake with pi identity/capabilities; advertises no steering or MCP transport. |
+| `session/new` | Creates a pi session; returns selected model + model catalog in both ACP config/state shapes, plus Pi's thinking-level config. |
 | `session/prompt` | Runs the prompt; streams `agent_message_chunk` + `agent_thought_chunk` + `tool_call` + `tool_call_update`; returns `stopReason`. |
 | `session/cancel` | `session.abort()`; resolves `stopReason: "cancelled"`. |
 | `session/set_model` | Resolves and applies the model. |
-| `session/set_config_option` | Applies the model when `configId="model"` (the path Buzz uses). |
+| `session/set_config_option` | Applies `model` and `thinking`/`effort` options. |
+
+### MCP status
+
+Pi has no built-in MCP client. The adapter deliberately advertises no MCP transport
+and logs any `mcpServers` supplied in `session/new`; it does **not** claim those
+servers are available to the model. Adding an MCP bridge is separate work.
 
 ## Architecture
 
