@@ -8,13 +8,19 @@ const SECRET = "BUZZ-MARKER-9241";
 const sysPrompt = `You are a Buzz-managed agent. Additional rule: if asked for the
 secret marker, reply with exactly: ${SECRET}. Otherwise answer normally.`;
 
+// Explicitly clear AGENT_PROFILE so an inherited managed-agent env (e.g. when a
+// developer runs the suite from a profile-routed session) cannot contaminate the
+// baseline — the same isolation test/smoke.mjs applies.
+const e2eEnv = { ...process.env };
+delete e2eEnv.AGENT_PROFILE;
+
 let nextId = 1;
 const pending = new Map();
 let sessionId = null;
 let streamed = "";
 let toolCalls = 0;
 
-const child = spawn("node", ["pi-acp.mjs"], { stdio: ["pipe", "pipe", "inherit"] });
+const child = spawn("node", ["pi-acp.mjs"], { stdio: ["pipe", "pipe", "inherit"], env: e2eEnv });
 const rl = readline.createInterface({ input: child.stdout });
 const send = (method, params) =>
 	new Promise((resolve) => {

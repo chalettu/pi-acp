@@ -13,8 +13,10 @@
  * assert on it without depending on the globally installed pi-open-agents
  * package (which would make the test environment-specific and non-portable).
  *
- * Loaded by pi-acp.mjs via the PI_ACP_TEST_EXTENSION_FACTORY env var, which
- * points at this file's absolute path.
+ * Discovered through pi's normal project-extension path: test/lifecycle.mjs
+ * points the adapter's session cwd at this file's grandparent directory
+ * (test/fixtures/project, via the PI_ACP_TEST_CWD env var), and pi auto-loads
+ * anything under <cwd>/.pi/extensions/. No special loader hook is needed.
  */
 export default async function agentFlagFixture(pi) {
 	// Register the flag immediately, before session_start — same as pi-open-agents.

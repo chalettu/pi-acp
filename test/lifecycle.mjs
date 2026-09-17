@@ -5,8 +5,11 @@
 // reads pi.getFlag("agent") inside its session_start handler, and the SDK's
 // bindExtensions() fires session_start on its LAST step — so the adapter must set
 // the flag before binding. We prove the ordering with a repo-local fixture
-// extension (test/fixtures/agent-flag-fixture.mjs) rather than depending on Chris's
-// globally installed pi-open-agents package, so the test is portable.
+// extension (test/fixtures/project/.pi/extensions/agent-flag-fixture.mjs) rather
+// than depending on Chris's globally installed pi-open-agents package, so the
+// test is portable. The fixture is discovered through pi's normal project-
+// extension path: the adapter's session cwd is pointed at the fixture project
+// (via PI_ACP_TEST_CWD), and pi auto-loads <cwd>/.pi/extensions/.
 //
 // Two scenarios:
 //   1. AGENT_PROFILE set  → the fixture must observe the value during session_start.
@@ -20,10 +23,13 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const FIXTURE = resolve(here, "fixtures/agent-flag-fixture.mjs");
+// The fixture project: its .pi/extensions/ holds the fixture extension, so the
+// adapter discovers it through pi's standard project-extension path. No other
+// project resources are present, so the session stays hermetic.
+const FIXTURE_PROJECT = resolve(here, "fixtures/project");
 
 function runAdapter({ agentProfile }) {
-	const env = { ...process.env, PI_ACP_TEST_EXTENSION_PATH: FIXTURE };
+	const env = { ...process.env, PI_ACP_TEST_CWD: FIXTURE_PROJECT };
 	delete env.AGENT_PROFILE;
 	if (agentProfile) env.AGENT_PROFILE = agentProfile;
 
@@ -82,7 +88,7 @@ let failures = 0;
 		});
 		assert.equal(init.error, undefined, "initialize must succeed");
 
-		const created = await request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		const created = await request("session/new", { cwd: FIXTURE_PROJECT, mcpServers: [] });
 		assert.equal(created.error, undefined, "session/new must succeed");
 		assert.equal(typeof created.result.sessionId, "string");
 
@@ -109,7 +115,7 @@ let failures = 0;
 		});
 		assert.equal(init.error, undefined, "initialize must succeed");
 
-		const created = await request("session/new", { cwd: process.cwd(), mcpServers: [] });
+		const created = await request("session/new", { cwd: FIXTURE_PROJECT, mcpServers: [] });
 		assert.equal(created.error, undefined, "session/new must succeed");
 
 		const seen = observedFlag(getStderr());

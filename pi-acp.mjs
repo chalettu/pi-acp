@@ -29,6 +29,7 @@ import {
 	createAgentSession,
 	DefaultResourceLoader,
 	ModelRuntime,
+	SessionManager,
 	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
@@ -219,28 +220,31 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 	}
 
 	// Append Buzz's system prompt (collaboration rules + persona) to pi's own.
-	// PI_ACP_TEST_EXTENSION_PATH is a test-only seam: it injects a repo-local
-	// fixture extension (test/fixtures/agent-flag-fixture.mjs) so the AGENT_PROFILE
-	// lifecycle regression can run without depending on Chris's globally installed
-	// pi-open-agents package. It is never set in production (the adapter reads no
-	// such env var outside tests).
-	const loaderOptions = {
-		cwd: cwd || process.cwd(),
+	// PI_ACP_TEST_CWD is a test-only cwd override: the AGENT_PROFILE lifecycle
+	// regression (test/lifecycle.mjs) points it at test/fixtures/project, whose
+	// .pi/extensions/ holds the repo-local fixture extension — discovered through
+	// pi's normal project-extension path, so production code carries no test
+	// backdoor. When unset, the session runs in the host-supplied cwd unchanged.
+	const sessionCwd = process.env.PI_ACP_TEST_CWD || cwd || process.cwd();
+	const loader = new DefaultResourceLoader({
+		cwd: sessionCwd,
 		agentDir,
 		appendSystemPrompt: systemPrompt ? [systemPrompt] : undefined,
-	};
-	if (process.env.PI_ACP_TEST_EXTENSION_PATH) {
-		loaderOptions.additionalExtensionPaths = [process.env.PI_ACP_TEST_EXTENSION_PATH];
-	}
-	const loader = new DefaultResourceLoader(loaderOptions);
+	});
 	// createAgentSession only reload()s a loader it built itself; since we supply
 	// our own, we must trigger the load that populates appendSystemPrompt.
 	await loader.reload();
 
+	// PI_ACP_TEST_SESSION_DIR is a test-only session-directory override: the
+	// AGENT_PROFILE live E2E (test/live-e2e.mjs) points it at a hermetic scratch
+	// dir so repeated runs never restore an old session's thinking level from
+	// disk. When unset, sessions persist to pi's default location unchanged.
+	const sessionDir = process.env.PI_ACP_TEST_SESSION_DIR || undefined;
 	const created = await createAgentSession({
-		cwd: cwd || undefined,
+		cwd: sessionCwd,
 		modelRuntime: runtime,
 		resourceLoader: loader,
+		...(sessionDir ? { sessionManager: SessionManager.create(sessionCwd, sessionDir) } : {}),
 	});
 	const session = created.session;
 
@@ -489,6 +493,10 @@ async function handleMessage(msg) {
 				return ok(id, result);
 			} catch (e) {
 				log("session/new failed:", e?.stack || e);
+				// Surface the wire error on stderr too: tests capture the child's
+				// stderr but not the JSON-RPC error body, so a failed session/new
+				// otherwise fails as an opaque timeout with no diagnostic.
+				process.stderr.write(`[pi-acp] session/new wire error: ${e?.message || e}\n`);
 				return fail(
 					id,
 					-32603,
