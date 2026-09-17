@@ -2,8 +2,15 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import * as readline from "node:readline";
 
+// Explicitly clear AGENT_PROFILE so an inherited managed-agent env (e.g. when a
+// developer runs the suite from a profile-routed session) cannot contaminate the
+// baseline. The baseline must reflect the configured default, not a profile.
+const smokeEnv = { ...process.env };
+delete smokeEnv.AGENT_PROFILE;
+
 const child = spawn("node", ["pi-acp.mjs"], {
 	stdio: ["pipe", "pipe", "inherit"],
+	env: smokeEnv,
 });
 const rl = readline.createInterface({ input: child.stdout });
 const pending = new Map();

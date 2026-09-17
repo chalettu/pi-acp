@@ -219,11 +219,20 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 	}
 
 	// Append Buzz's system prompt (collaboration rules + persona) to pi's own.
-	const loader = new DefaultResourceLoader({
+	// PI_ACP_TEST_EXTENSION_PATH is a test-only seam: it injects a repo-local
+	// fixture extension (test/fixtures/agent-flag-fixture.mjs) so the AGENT_PROFILE
+	// lifecycle regression can run without depending on Chris's globally installed
+	// pi-open-agents package. It is never set in production (the adapter reads no
+	// such env var outside tests).
+	const loaderOptions = {
 		cwd: cwd || process.cwd(),
 		agentDir,
 		appendSystemPrompt: systemPrompt ? [systemPrompt] : undefined,
-	});
+	};
+	if (process.env.PI_ACP_TEST_EXTENSION_PATH) {
+		loaderOptions.additionalExtensionPaths = [process.env.PI_ACP_TEST_EXTENSION_PATH];
+	}
+	const loader = new DefaultResourceLoader(loaderOptions);
 	// createAgentSession only reload()s a loader it built itself; since we supply
 	// our own, we must trigger the load that populates appendSystemPrompt.
 	await loader.reload();
@@ -234,6 +243,37 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 		resourceLoader: loader,
 	});
 	const session = created.session;
+
+	// Agent routing: if AGENT_PROFILE is set (e.g. by the pi-infisical-acp
+	// wrapper), request that agent BEFORE binding extensions. Extensions that
+	// register a string "agent" CLI flag (e.g. pi-open-agents) read the flag
+	// value during their session_start handler, and the SDK's bindExtensions()
+	// fires session_start on its LAST step. Setting the flag before binding is
+	// therefore the only order in which the profile can take effect — setting
+	// it after bindExtensions() is a no-op because session_start has already
+	// run with an empty flag. We say "request" (not "apply") because the adapter
+	// cannot verify the extension actually activated the profile; activation is
+	// proven by the live end-to-end check, not by this call.
+	const agentProfile = process.env.AGENT_PROFILE;
+	if (agentProfile) {
+		try {
+			session.extensionRunner.setFlagValue("agent", agentProfile);
+			log(`requesting AGENT_PROFILE: ${agentProfile}`);
+		} catch (err) {
+			log(`AGENT_PROFILE: failed to request "${agentProfile}": ${err.message}`);
+		}
+	}
+
+	// Bind extensions so lifecycle events (session_start) fire — and so the
+	// AGENT_PROFILE flag requested above is read during session_start. The SDK's
+	// createAgentSession() does NOT do this — only the interactive/print/rpc
+	// modes call bindExtensions(). Without it, extensions that bootstrap on
+	// session_start (e.g. pi-open-agents, @agney/pi-honcho-memory) never
+	// initialize in ACP mode and their tools report "not connected". The default
+	// no-op UI context is safe: extensions that need UI degrade gracefully.
+	// Binding must happen before any prompt so the profile applies its model,
+	// thinking level, tools, and prompt during session_start.
+	await session.bindExtensions({ mode: "rpc" });
 
 	const models = buildModelOptions(runtime);
 	// If pi's default model isn't in our surfaced list (e.g. its provider has
