@@ -5,7 +5,7 @@
 // reads pi.getFlag("agent") inside its session_start handler, and the SDK's
 // bindExtensions() fires session_start on its LAST step — so the adapter must set
 // the flag before binding. We prove the ordering with a repo-local fixture
-// extension (test/fixtures/project/.pi/extensions/agent-flag-fixture.mjs) rather
+// extension (test/fixtures/project/.pi/extensions/agent-flag-fixture.js) rather
 // than depending on Chris's globally installed pi-open-agents package, so the
 // test is portable. The fixture is discovered through pi's normal project-
 // extension path: the adapter's session cwd is pointed at the fixture project
