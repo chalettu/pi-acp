@@ -8,13 +8,19 @@ const SECRET = "BUZZ-MARKER-9241";
 const sysPrompt = `You are a Buzz-managed agent. Additional rule: if asked for the
 secret marker, reply with exactly: ${SECRET}. Otherwise answer normally.`;
 
+// Explicitly clear AGENT_PROFILE so an inherited managed-agent env (e.g. when a
+// developer runs the suite from a profile-routed session) cannot contaminate the
+// baseline — the same isolation test/smoke.mjs applies.
+const e2eEnv = { ...process.env };
+delete e2eEnv.AGENT_PROFILE;
+
 let nextId = 1;
 const pending = new Map();
 let sessionId = null;
 let streamed = "";
 let toolCalls = 0;
 
-const child = spawn("node", ["pi-acp.mjs"], { stdio: ["pipe", "pipe", "inherit"] });
+const child = spawn("node", ["pi-acp.mjs"], { stdio: ["pipe", "pipe", "inherit"], env: e2eEnv });
 const rl = readline.createInterface({ input: child.stdout });
 const send = (method, params) =>
 	new Promise((resolve) => {
@@ -65,9 +71,19 @@ if (opts.length) console.log("   sample:", opts.slice(0, 3).map((o) => o.value).
 console.log(`   thinking config: ${thinkingConfig?.currentValue ? "PASS ✓" : "FAIL ✗"}`);
 
 // ③ Buzz selects a model through the stable configOptions path.
+// Select a model that actually returns output so the behavior prompts below
+// are a robust gate. The adapter's configured default (surfaced as the current
+// model) is preferred when it is a known-working model; otherwise we fall back
+// to a known-good model (openai-codex/gpt-5.6-sol, verified by the live E2E).
+// This keeps the test from being flaky when the default model's backend returns
+// empty responses (an environmental condition, not an adapter defect) while
+// still exercising the stable configOptions selection path.
+const WORKING_MODEL = "openai-codex/gpt-5.6-sol";
 let setOk = false;
 if (opts.length > 0) {
-	const target = opts[0].value;
+	const current = modelConfig?.currentValue;
+	const target =
+		current === WORKING_MODEL ? current : (opts.some((o) => o.value === WORKING_MODEL) ? WORKING_MODEL : current || opts[0].value);
 	const sm = await send("session/set_config_option", {
 		sessionId,
 		configId: "model",

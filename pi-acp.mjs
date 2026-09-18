@@ -29,7 +29,10 @@ import {
 	createAgentSession,
 	DefaultResourceLoader,
 	ModelRuntime,
+	SettingsManager,
 	getAgentDir,
+	hasTrustRequiringProjectResources,
+	ProjectTrustStore,
 } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 
@@ -40,6 +43,33 @@ const ok = (id, result = {}) => send({ jsonrpc: "2.0", id, result });
 const fail = (id, code, message) =>
 	send({ jsonrpc: "2.0", id, error: { code, message } });
 const notify = (method, params) => send({ jsonrpc: "2.0", method, params });
+
+/**
+ * Resolve the SDK project-trust decision for a cwd, mirroring the upstream CLI
+ * (dist/main.js) but headless-safe: ACP is a no-UI transport, so an untrusted
+ * project with no recorded decision defaults to UNTRUSTED (the same default the
+ * SDK applies to headless/no-UI mode in project-trust.js). A user's explicit
+ * trust.json decision always wins. The result is passed to the resource loader
+ * so project-local extensions are only loaded/bound for trusted projects —
+ * preserving the SDK trust boundary that the raw DefaultResourceLoader path
+ * would otherwise bypass (an untrusted project's .pi/extensions/ must NOT
+ * execute, since session/new.cwd crosses the ACP boundary).
+ */
+async function resolveProjectTrust(cwd, agentDir, settingsManager) {
+	if (!hasTrustRequiringProjectResources(cwd)) return true;
+	const store = new ProjectTrustStore(agentDir);
+	const decision = store.get(cwd);
+	if (decision !== null) return decision;
+	switch (settingsManager.getDefaultProjectTrust()) {
+		case "always":
+			return true;
+		case "never":
+			return false;
+		default:
+			// "ask" — but ACP has no UI to prompt, so default to untrusted.
+			return false;
+	}
+}
 
 /** Emit a `session/update` notification (the streaming channel Buzz reads). */
 const sessionUpdate = (sessionId, update) =>
@@ -218,27 +248,80 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 		log("session/new: MCP servers supplied but unsupported by pi; ignoring", mcpServers.length);
 	}
 
-	// Append Buzz's system prompt (collaboration rules + persona) to pi's own.
+	const sessionCwd = cwd || process.cwd();
+
+	// Resolve project trust BEFORE the resource loader loads project-local
+	// extensions. A shared SettingsManager carries the decision into the loader's
+	// reload({ resolveProjectTrust }) path, which — like the upstream CLI — first
+	// loads extensions under forced-untrusted settings (bootstrap), then applies
+	// the resolved decision, so an untrusted project's .pi/extensions/ is never
+	// loaded or bound. Global/user extensions (e.g. pi-open-agents) are user
+	// resources and are unaffected. Without this the raw DefaultResourceLoader
+	// path defaulted projectTrusted to true and would execute an untrusted
+	// project's extensions.
+	const settingsManager = SettingsManager.create(sessionCwd, agentDir);
+	const projectTrusted = await resolveProjectTrust(sessionCwd, agentDir, settingsManager);
+	if (!projectTrusted) {
+		log("project not trusted; project-local extensions will not load", sessionCwd);
+	}
 	const loader = new DefaultResourceLoader({
-		cwd: cwd || process.cwd(),
+		cwd: sessionCwd,
 		agentDir,
+		settingsManager,
 		appendSystemPrompt: systemPrompt ? [systemPrompt] : undefined,
 	});
 	// createAgentSession only reload()s a loader it built itself; since we supply
-	// our own, we must trigger the load that populates appendSystemPrompt.
-	await loader.reload();
+	// our own, we must trigger the load that populates appendSystemPrompt. The
+	// resolveProjectTrust callback preserves the already-resolved decision.
+	await loader.reload({
+		resolveProjectTrust: async () => projectTrusted,
+	});
 
 	const created = await createAgentSession({
-		cwd: cwd || undefined,
+		cwd: sessionCwd,
 		modelRuntime: runtime,
+		settingsManager,
 		resourceLoader: loader,
 	});
 	const session = created.session;
 
+	// Agent routing: if AGENT_PROFILE is set (e.g. by the pi-infisical-acp
+	// wrapper), request that agent BEFORE binding extensions. Extensions that
+	// register a string "agent" CLI flag (e.g. pi-open-agents) read the flag
+	// value during their session_start handler, and the SDK's bindExtensions()
+	// fires session_start on its LAST step. Setting the flag before binding is
+	// therefore the only order in which the profile can take effect — setting
+	// it after bindExtensions() is a no-op because session_start has already
+	// run with an empty flag. We say "request" (not "apply") because the adapter
+	// cannot verify the extension actually activated the profile; activation is
+	// proven by the live end-to-end check, not by this call.
+	const agentProfile = process.env.AGENT_PROFILE;
+	if (agentProfile) {
+		try {
+			session.extensionRunner.setFlagValue("agent", agentProfile);
+			log(`requesting AGENT_PROFILE: ${agentProfile}`);
+		} catch (err) {
+			log(`AGENT_PROFILE: failed to request "${agentProfile}": ${err.message}`);
+		}
+	}
+
+	// Bind extensions so lifecycle events (session_start) fire — and so the
+	// AGENT_PROFILE flag requested above is read during session_start. The SDK's
+	// createAgentSession() does NOT do this — only the interactive/print/rpc
+	// modes call bindExtensions(). Without it, extensions that bootstrap on
+	// session_start (e.g. pi-open-agents, @agney/pi-honcho-memory) never
+	// initialize in ACP mode and their tools report "not connected". The default
+	// no-op UI context is safe: extensions that need UI degrade gracefully.
+	// Binding must happen before any prompt so the profile applies its model,
+	// thinking level, tools, and prompt during session_start.
+	await session.bindExtensions({ mode: "rpc" });
+
 	const models = buildModelOptions(runtime);
 	// If pi's default model isn't in our surfaced list (e.g. its provider has
-	// no configured auth), switch to the first available model before any
-	// prompt runs, so the session never starts on an unusable model.
+	// no configured auth), switch to the first available model so the session
+	// never starts on an unusable model. This is a creation guard only — the
+	// session's current model becomes the fallback, and the host (Buzz) can
+	// select a different model via set_config_option before prompting.
 	const cur = session.model;
 	if (cur && !models.byValue.has(`${cur.provider}/${cur.id}`) && models.options.length > 0) {
 		const fallback = models.byValue.get(models.options[0].value);
@@ -449,6 +532,10 @@ async function handleMessage(msg) {
 				return ok(id, result);
 			} catch (e) {
 				log("session/new failed:", e?.stack || e);
+				// Surface the wire error on stderr too: tests capture the child's
+				// stderr but not the JSON-RPC error body, so a failed session/new
+				// otherwise fails as an opaque timeout with no diagnostic.
+				process.stderr.write(`[pi-acp] session/new wire error: ${e?.message || e}\n`);
 				return fail(
 					id,
 					-32603,

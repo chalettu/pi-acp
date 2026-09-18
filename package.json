@@ -10,6 +10,8 @@
   "scripts": {
     "start": "node pi-acp.mjs",
     "test": "node test/smoke.mjs",
+    "test:lifecycle": "node test/lifecycle.mjs",
+    "test:live": "node test/live-e2e.mjs",
     "test:e2e": "node test/e2e.mjs"
   },
   "keywords": [
