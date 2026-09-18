@@ -57,12 +57,7 @@ const notify = (method, params) => send({ jsonrpc: "2.0", method, params });
  */
 async function resolveProjectTrust(cwd, agentDir, settingsManager) {
 	if (!hasTrustRequiringProjectResources(cwd)) return true;
-	// PI_TRUST_STORE is a test-only override of the trust-store location (not a
-	// behavior backdoor): tests point it at a hermetic temp dir so the trust
-	// decision is controlled in-memory instead of mutating the user's real
-	// ~/.pi/agent/trust.json. When unset, the default agentDir store is used.
-	const trustAgentDir = process.env.PI_TRUST_STORE || agentDir;
-	const store = new ProjectTrustStore(trustAgentDir);
+	const store = new ProjectTrustStore(agentDir);
 	const decision = store.get(cwd);
 	if (decision !== null) return decision;
 	switch (settingsManager.getDefaultProjectTrust()) {
@@ -324,11 +319,9 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 	const models = buildModelOptions(runtime);
 	// If pi's default model isn't in our surfaced list (e.g. its provider has
 	// no configured auth), switch to the first available model so the session
-	// never starts on an unusable model — then restore the original configured
-	// model as the session's current model. The fallback is only a guard so the
-	// session can be created at all; the user's configured default remains the
-	// active model (surfaced as the current model in configOptions) so behavior
-	// runs on the real configured model, not on options[0].
+	// never starts on an unusable model. This is a creation guard only — the
+	// session's current model becomes the fallback, and the host (Buzz) can
+	// select a different model via set_config_option before prompting.
 	const cur = session.model;
 	if (cur && !models.byValue.has(`${cur.provider}/${cur.id}`) && models.options.length > 0) {
 		const fallback = models.byValue.get(models.options[0].value);
@@ -338,12 +331,6 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 				log("default model was unavailable, switched to", models.options[0].value);
 			} catch (e) {
 				log("could not switch default model:", e?.message);
-			}
-			try {
-				await session.setModel(cur);
-				log("restored configured model", `${cur.provider}/${cur.id}`);
-			} catch (e) {
-				log("could not restore configured model:", e?.message);
 			}
 		}
 	}

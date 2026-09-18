@@ -20,47 +20,81 @@
 //   3. Untrusted project → the fixture must NOT execute (no AGENT_FLAG_SEEN).
 //   4. Explicitly trusted project → the fixture must execute (AGENT_FLAG_SEEN).
 //
-// Part B drives a HERMETIC trust store via PI_TRUST_STORE (a supported test
-// override, not a production backdoor): it points the adapter at a temp
-// trust.json so the trust decision is controlled in-memory rather than mutating
-// the user's real ~/.pi/agent/trust.json. The fixture project is NOT trusted
-// in the store, so scenario 3 exercises the untrusted path and scenario 4 adds
-// an explicit trust entry.
+// Hermeticity: every scenario runs the adapter in a child process whose
+// PI_CODING_AGENT_DIR points to a fresh OS temp directory (mkdtemp). The temp
+// agent dir contains a canonical-path trust.json we control and a copy of the
+// real auth.json (so the ModelRuntime has provider auth for session creation).
+// This makes the trust decision fully deterministic — the test never reads or
+// writes the user's real ~/.pi/agent/trust.json, and the four scenarios are
+// independent of each other and of the machine's trust state.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+	mkdirSync,
+	writeFileSync,
+	rmSync,
+	cpSync,
+	mkdtempSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // The fixture project: its .pi/extensions/ holds the fixture extension, so the
 // adapter discovers it through pi's standard project-extension path. No other
 // project resources are present, so the session stays hermetic.
 const FIXTURE_PROJECT = resolve(here, "fixtures/project");
-// Hermetic trust store for the project-trust regression: a temp dir holding a
-// trust.json we control, so the decision is deterministic and we never mutate
-// the user's real ~/.pi/agent/trust.json.
-const TRUST_DIR = resolve(here, "fixtures", "trust");
-rmSync(TRUST_DIR, { recursive: true, force: true });
-mkdirSync(TRUST_DIR, { recursive: true });
+// The real agent dir (for copying auth.json into the hermetic temp dir).
+const REAL_AGENT_DIR = join(
+	dirname(process.env.HOME || process.env.USERPROFILE || "/root"),
+	".pi",
+	"agent",
+);
+const REAL_AUTH = join(REAL_AGENT_DIR, "auth.json");
 
-function runAdapter({ agentProfile, trusted = false, trustStore = null }) {
+/**
+ * Create a hermetic temp agent directory for one scenario:
+ *   - trust.json with the given trust decision for FIXTURE_PROJECT
+ *   - a copy of the real auth.json (so ModelRuntime has provider auth)
+ * Returns the temp dir path; the caller must rmSync it in a finally block.
+ */
+function createHermeticAgentDir(trusted) {
+	const dir = mkdtempSync(join(tmpdir(), "pi-acp-test-"));
+	mkdirSync(dir, { recursive: true });
+	// Canonical-path trust.json: the SDK's ProjectTrustStore normalizes cwd
+	// via canonicalizePath(resolvePath(cwd)), so the key must match the
+	// canonicalized fixture path.
+	const trustData = trusted ? { [FIXTURE_PROJECT]: true } : {};
+	writeFileSync(join(dir, "trust.json"), JSON.stringify(trustData, null, 2) + "\n");
+	// Copy auth.json so the ModelRuntime can authenticate with providers.
+	// Without it, session creation may still succeed (with no models) but the
+	// test would be vacuous.
+	try {
+		cpSync(REAL_AUTH, join(dir, "auth.json"));
+	} catch {
+		// No auth.json — the test will still exercise the trust boundary
+		// (extension loading happens before model selection), but model
+		// options will be empty.
+	}
+	return dir;
+}
+
+function runAdapter({ agentProfile, trusted = false }) {
+	const tempAgentDir = createHermeticAgentDir(trusted);
 	const env = { ...process.env };
-	delete env.PI_ACP_TEST_CWD; // removed — cwd now comes from session/new
-	delete env.PI_ACP_TEST_SESSION_DIR; // removed — session dir now comes from session/new
+	delete env.PI_ACP_TEST_CWD;
+	delete env.PI_ACP_TEST_SESSION_DIR;
+	delete env.PI_TRUST_STORE;
 	delete env.AGENT_PROFILE;
 	if (agentProfile) env.AGENT_PROFILE = agentProfile;
-	if (trustStore) env.PI_TRUST_STORE = trustStore;
-	// When a hermetic trust store is supplied, seed it: trusted=true records an
-	// explicit trust for the fixture project; trusted=false leaves it absent so
-	// the headless default (untrusted) applies.
-	if (trustStore) {
-		writeFileSync(
-			join(TRUST_DIR, "trust.json"),
-			JSON.stringify(trusted ? { [FIXTURE_PROJECT]: true } : {}),
-		);
-	}
+	// PI_CODING_AGENT_DIR is the SDK-supported override for the agent
+	// directory (config.js: getAgentDir() reads it). Pointing it at the
+	// hermetic temp dir makes the trust store, settings, and session dir
+	// all live under the temp path — fully isolated from the user's real
+	// ~/.pi/agent/.
+	env.PI_CODING_AGENT_DIR = tempAgentDir;
 
 	const child = spawn("node", [resolve(here, "..", "pi-acp.mjs")], {
 		stdio: ["pipe", "pipe", "pipe"],
@@ -96,7 +130,7 @@ function runAdapter({ agentProfile, trusted = false, trustStore = null }) {
 		});
 	}
 
-	return { child, request, getStderr: () => stderr };
+	return { child, request, getStderr: () => stderr, tempAgentDir };
 }
 
 function observedFlag(stderr) {
@@ -107,11 +141,11 @@ function observedFlag(stderr) {
 let failures = 0;
 
 // ── Scenario 1: AGENT_PROFILE set → fixture sees the value ─────────────────
-// The fixture project is trusted in the user's real trust store, so the
-// project-extension path loads the fixture and the lifecycle ordering is
+// Hermetic agent dir with an explicit trust entry for the fixture project:
+// the project-extension path loads the fixture and the lifecycle ordering is
 // exercised end to end.
 {
-	const { child, request, getStderr } = runAdapter({ agentProfile: "tech-lead" });
+	const { child, request, getStderr, tempAgentDir } = runAdapter({ agentProfile: "tech-lead", trusted: true });
 	try {
 		const init = await request("initialize", {
 			protocolVersion: 2,
@@ -133,12 +167,15 @@ let failures = 0;
 	} finally {
 		child.stdin.end();
 		await new Promise((r) => child.once("exit", r));
+		rmSync(tempAgentDir, { recursive: true, force: true });
 	}
 }
 
 // ── Scenario 2: AGENT_PROFILE unset → fixture sees (none) ──────────────────
+// Same hermetic setup, but no AGENT_PROFILE env: the fixture must observe
+// (none) — no profile applied.
 {
-	const { child, request, getStderr } = runAdapter({ agentProfile: undefined });
+	const { child, request, getStderr, tempAgentDir } = runAdapter({ agentProfile: undefined, trusted: true });
 	try {
 		const init = await request("initialize", {
 			protocolVersion: 2,
@@ -159,6 +196,7 @@ let failures = 0;
 	} finally {
 		child.stdin.end();
 		await new Promise((r) => child.once("exit", r));
+		rmSync(tempAgentDir, { recursive: true, force: true });
 	}
 }
 
@@ -168,10 +206,9 @@ let failures = 0;
 // .pi/extensions/. The fixture's session_start handler must never run, so no
 // AGENT_FLAG_SEEN marker appears on stderr.
 {
-	const { child, request, getStderr } = runAdapter({
+	const { child, request, getStderr, tempAgentDir } = runAdapter({
 		agentProfile: "tech-lead",
 		trusted: false,
-		trustStore: TRUST_DIR,
 	});
 	try {
 		const init = await request("initialize", {
@@ -193,6 +230,7 @@ let failures = 0;
 	} finally {
 		child.stdin.end();
 		await new Promise((r) => child.once("exit", r));
+		rmSync(tempAgentDir, { recursive: true, force: true });
 	}
 }
 
@@ -201,10 +239,9 @@ let failures = 0;
 // the adapter must load/bind the project extension, so the fixture's
 // session_start handler runs and the AGENT_PROFILE flag is observed.
 {
-	const { child, request, getStderr } = runAdapter({
+	const { child, request, getStderr, tempAgentDir } = runAdapter({
 		agentProfile: "tech-lead",
 		trusted: true,
-		trustStore: TRUST_DIR,
 	});
 	try {
 		const init = await request("initialize", {
@@ -226,6 +263,7 @@ let failures = 0;
 	} finally {
 		child.stdin.end();
 		await new Promise((r) => child.once("exit", r));
+		rmSync(tempAgentDir, { recursive: true, force: true });
 	}
 }
 
