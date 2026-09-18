@@ -22,23 +22,18 @@
 //
 // Hermeticity: every scenario runs the adapter in a child process whose
 // PI_CODING_AGENT_DIR points to a fresh OS temp directory (mkdtemp). The temp
-// agent dir contains a canonical-path trust.json we control and a copy of the
-// real auth.json (so the ModelRuntime has provider auth for session creation).
-// This makes the trust decision fully deterministic — the test never reads or
-// writes the user's real ~/.pi/agent/trust.json, and the four scenarios are
-// independent of each other and of the machine's trust state.
+// agent dir contains only a canonical-path trust.json we control. No model
+// auth is needed — the trust/lifecycle scenarios exercise extension loading
+// and flag ordering, which happen before model selection. This makes the
+// trust decision fully deterministic — the test never reads or writes the
+// user's real ~/.pi/agent/ state, and the four scenarios are independent of
+// each other and of the machine's trust state.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
-import {
-	mkdirSync,
-	writeFileSync,
-	rmSync,
-	cpSync,
-	mkdtempSync,
-} from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -46,18 +41,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 // adapter discovers it through pi's standard project-extension path. No other
 // project resources are present, so the session stays hermetic.
 const FIXTURE_PROJECT = resolve(here, "fixtures/project");
-// The real agent dir (for copying auth.json into the hermetic temp dir).
-const REAL_AGENT_DIR = join(
-	dirname(process.env.HOME || process.env.USERPROFILE || "/root"),
-	".pi",
-	"agent",
-);
-const REAL_AUTH = join(REAL_AGENT_DIR, "auth.json");
 
 /**
  * Create a hermetic temp agent directory for one scenario:
  *   - trust.json with the given trust decision for FIXTURE_PROJECT
- *   - a copy of the real auth.json (so ModelRuntime has provider auth)
+ * No auth.json is copied — the trust/lifecycle scenarios need no model, and
+ * duplicating real credentials into temp storage is poor security hygiene.
  * Returns the temp dir path; the caller must rmSync it in a finally block.
  */
 function createHermeticAgentDir(trusted) {
@@ -68,16 +57,6 @@ function createHermeticAgentDir(trusted) {
 	// canonicalized fixture path.
 	const trustData = trusted ? { [FIXTURE_PROJECT]: true } : {};
 	writeFileSync(join(dir, "trust.json"), JSON.stringify(trustData, null, 2) + "\n");
-	// Copy auth.json so the ModelRuntime can authenticate with providers.
-	// Without it, session creation may still succeed (with no models) but the
-	// test would be vacuous.
-	try {
-		cpSync(REAL_AUTH, join(dir, "auth.json"));
-	} catch {
-		// No auth.json — the test will still exercise the trust boundary
-		// (extension loading happens before model selection), but model
-		// options will be empty.
-	}
 	return dir;
 }
 
