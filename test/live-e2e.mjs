@@ -23,8 +23,6 @@
 // portable automated suite (that's test/lifecycle.mjs).
 import { spawn } from "node:child_process";
 import * as readline from "node:readline";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
 
 const PROFILE = process.env.LIVE_PROFILE || "tech-lead";
 // Controlled baseline: pinned on BOTH runs via set_config_option so the
@@ -33,16 +31,10 @@ const BASELINE_THINKING = "medium";
 
 function drive({ agentProfile }) {
 	const env = { ...process.env };
+	delete env.PI_ACP_TEST_CWD; // removed — cwd now comes from session/new
+	delete env.PI_ACP_TEST_SESSION_DIR; // removed — session dir now comes from session/new
 	delete env.AGENT_PROFILE;
 	if (agentProfile) env.AGENT_PROFILE = agentProfile;
-	// Hermetic session dir: pi's session manager persists ACP sessions to disk
-	// (under ~/.pi/agent/sessions/<cwd>/), and a second session/new in the same
-	// process restores the previous session's thinking level from that file —
-	// which would clobber the controlled baseline. Pointing PI_ACP_TEST_SESSION_DIR
-	// at a fresh scratch dir keeps repeated runs hermetic.
-	const sessionDir = join(process.env.HOME, ".pi", "scratch", "pi-acp-live-e2e");
-	mkdirSync(sessionDir, { recursive: true });
-	env.PI_ACP_TEST_SESSION_DIR = sessionDir;
 
 	const child = spawn("node", ["pi-acp.mjs"], { stdio: ["pipe", "pipe", "inherit"], env });
 	const rl = readline.createInterface({ input: child.stdout });

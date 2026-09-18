@@ -1,3 +1,5 @@
 node_modules/
 *.log
 .DS_Store
+# Hermetic trust store written by test/lifecycle.mjs (project-trust regression)
+test/fixtures/trust/

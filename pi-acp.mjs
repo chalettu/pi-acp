@@ -29,8 +29,10 @@ import {
 	createAgentSession,
 	DefaultResourceLoader,
 	ModelRuntime,
-	SessionManager,
+	SettingsManager,
 	getAgentDir,
+	hasTrustRequiringProjectResources,
+	ProjectTrustStore,
 } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 
@@ -41,6 +43,38 @@ const ok = (id, result = {}) => send({ jsonrpc: "2.0", id, result });
 const fail = (id, code, message) =>
 	send({ jsonrpc: "2.0", id, error: { code, message } });
 const notify = (method, params) => send({ jsonrpc: "2.0", method, params });
+
+/**
+ * Resolve the SDK project-trust decision for a cwd, mirroring the upstream CLI
+ * (dist/main.js) but headless-safe: ACP is a no-UI transport, so an untrusted
+ * project with no recorded decision defaults to UNTRUSTED (the same default the
+ * SDK applies to headless/no-UI mode in project-trust.js). A user's explicit
+ * trust.json decision always wins. The result is passed to the resource loader
+ * so project-local extensions are only loaded/bound for trusted projects —
+ * preserving the SDK trust boundary that the raw DefaultResourceLoader path
+ * would otherwise bypass (an untrusted project's .pi/extensions/ must NOT
+ * execute, since session/new.cwd crosses the ACP boundary).
+ */
+async function resolveProjectTrust(cwd, agentDir, settingsManager) {
+	if (!hasTrustRequiringProjectResources(cwd)) return true;
+	// PI_TRUST_STORE is a test-only override of the trust-store location (not a
+	// behavior backdoor): tests point it at a hermetic temp dir so the trust
+	// decision is controlled in-memory instead of mutating the user's real
+	// ~/.pi/agent/trust.json. When unset, the default agentDir store is used.
+	const trustAgentDir = process.env.PI_TRUST_STORE || agentDir;
+	const store = new ProjectTrustStore(trustAgentDir);
+	const decision = store.get(cwd);
+	if (decision !== null) return decision;
+	switch (settingsManager.getDefaultProjectTrust()) {
+		case "always":
+			return true;
+		case "never":
+			return false;
+		default:
+			// "ask" — but ACP has no UI to prompt, so default to untrusted.
+			return false;
+	}
+}
 
 /** Emit a `session/update` notification (the streaming channel Buzz reads). */
 const sessionUpdate = (sessionId, update) =>
@@ -219,32 +253,40 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 		log("session/new: MCP servers supplied but unsupported by pi; ignoring", mcpServers.length);
 	}
 
-	// Append Buzz's system prompt (collaboration rules + persona) to pi's own.
-	// PI_ACP_TEST_CWD is a test-only cwd override: the AGENT_PROFILE lifecycle
-	// regression (test/lifecycle.mjs) points it at test/fixtures/project, whose
-	// .pi/extensions/ holds the repo-local fixture extension — discovered through
-	// pi's normal project-extension path, so production code carries no test
-	// backdoor. When unset, the session runs in the host-supplied cwd unchanged.
-	const sessionCwd = process.env.PI_ACP_TEST_CWD || cwd || process.cwd();
+	const sessionCwd = cwd || process.cwd();
+
+	// Resolve project trust BEFORE the resource loader loads project-local
+	// extensions. A shared SettingsManager carries the decision into the loader's
+	// reload({ resolveProjectTrust }) path, which — like the upstream CLI — first
+	// loads extensions under forced-untrusted settings (bootstrap), then applies
+	// the resolved decision, so an untrusted project's .pi/extensions/ is never
+	// loaded or bound. Global/user extensions (e.g. pi-open-agents) are user
+	// resources and are unaffected. Without this the raw DefaultResourceLoader
+	// path defaulted projectTrusted to true and would execute an untrusted
+	// project's extensions.
+	const settingsManager = SettingsManager.create(sessionCwd, agentDir);
+	const projectTrusted = await resolveProjectTrust(sessionCwd, agentDir, settingsManager);
+	if (!projectTrusted) {
+		log("project not trusted; project-local extensions will not load", sessionCwd);
+	}
 	const loader = new DefaultResourceLoader({
 		cwd: sessionCwd,
 		agentDir,
+		settingsManager,
 		appendSystemPrompt: systemPrompt ? [systemPrompt] : undefined,
 	});
 	// createAgentSession only reload()s a loader it built itself; since we supply
-	// our own, we must trigger the load that populates appendSystemPrompt.
-	await loader.reload();
+	// our own, we must trigger the load that populates appendSystemPrompt. The
+	// resolveProjectTrust callback preserves the already-resolved decision.
+	await loader.reload({
+		resolveProjectTrust: async () => projectTrusted,
+	});
 
-	// PI_ACP_TEST_SESSION_DIR is a test-only session-directory override: the
-	// AGENT_PROFILE live E2E (test/live-e2e.mjs) points it at a hermetic scratch
-	// dir so repeated runs never restore an old session's thinking level from
-	// disk. When unset, sessions persist to pi's default location unchanged.
-	const sessionDir = process.env.PI_ACP_TEST_SESSION_DIR || undefined;
 	const created = await createAgentSession({
 		cwd: sessionCwd,
 		modelRuntime: runtime,
+		settingsManager,
 		resourceLoader: loader,
-		...(sessionDir ? { sessionManager: SessionManager.create(sessionCwd, sessionDir) } : {}),
 	});
 	const session = created.session;
 
@@ -281,8 +323,12 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 
 	const models = buildModelOptions(runtime);
 	// If pi's default model isn't in our surfaced list (e.g. its provider has
-	// no configured auth), switch to the first available model before any
-	// prompt runs, so the session never starts on an unusable model.
+	// no configured auth), switch to the first available model so the session
+	// never starts on an unusable model — then restore the original configured
+	// model as the session's current model. The fallback is only a guard so the
+	// session can be created at all; the user's configured default remains the
+	// active model (surfaced as the current model in configOptions) so behavior
+	// runs on the real configured model, not on options[0].
 	const cur = session.model;
 	if (cur && !models.byValue.has(`${cur.provider}/${cur.id}`) && models.options.length > 0) {
 		const fallback = models.byValue.get(models.options[0].value);
@@ -292,6 +338,12 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 				log("default model was unavailable, switched to", models.options[0].value);
 			} catch (e) {
 				log("could not switch default model:", e?.message);
+			}
+			try {
+				await session.setModel(cur);
+				log("restored configured model", `${cur.provider}/${cur.id}`);
+			} catch (e) {
+				log("could not restore configured model:", e?.message);
 			}
 		}
 	}
