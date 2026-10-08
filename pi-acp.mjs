@@ -27,6 +27,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	createAgentSession,
+	createCodemodeExtension,
+	createMcpExtension,
 	DefaultResourceLoader,
 	ModelRuntime,
 	SettingsManager,
@@ -243,9 +245,11 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 	const runtime = await getModelRuntime();
 	const agentDir = getAgentDir();
 	if (Array.isArray(mcpServers) && mcpServers.length > 0) {
-		// Pi intentionally has no built-in MCP client. Do not claim these servers
-		// are available to the model merely because an ACP host supplied them.
-		log("session/new: MCP servers supplied but unsupported by pi; ignoring", mcpServers.length);
+		// Pi has a built-in MCP client since SDK 1.0.4 (registered via the
+		// loader's extensionFactories), but it connects servers from the user's
+		// mcp.json — not from ACP session/new params. Host-supplied servers are
+		// still not forwarded; do not claim they are available to the model.
+		log("session/new: host MCP servers not forwarded (mcp.json servers still load); ignoring", mcpServers.length);
 	}
 
 	const sessionCwd = cwd || process.cwd();
@@ -269,6 +273,13 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 		agentDir,
 		settingsManager,
 		appendSystemPrompt: systemPrompt ? [systemPrompt] : undefined,
+		// SDK 1.0.4+ built-ins. The CLI registers these itself; SDK hosts must
+		// supply them or the tools are absent. codemode registers INACTIVE and
+		// is activated per session by the settings defaultTools entry
+		// ("+codemode") or the host's --tools; the MCP extension connects the
+		// user's mcp.json servers on session_start. Neither needs a UI, so the
+		// default no-op context is fine.
+		extensionFactories: [createCodemodeExtension(), createMcpExtension()],
 	});
 	// createAgentSession only reload()s a loader it built itself; since we supply
 	// our own, we must trigger the load that populates appendSystemPrompt. The
@@ -315,6 +326,15 @@ async function newPiSession(sessionId, { cwd, mcpServers, systemPrompt } = {}) {
 	// Binding must happen before any prompt so the profile applies its model,
 	// thinking level, tools, and prompt during session_start.
 	await session.bindExtensions({ mode: "rpc" });
+
+	// Activation diagnostic: prove the built-ins survived binding and any
+	// persona allowlist filtering. This is the runtime check the SDK-vs-CLI
+	// integration lesson requires — "registered" alone is not "active".
+	try {
+		log("active tools:", (await session.getActiveToolNames()).join(", "));
+	} catch (err) {
+		log(`active tools diagnostic failed: ${err.message}`);
+	}
 
 	const models = buildModelOptions(runtime);
 	// If pi's default model isn't in our surfaced list (e.g. its provider has
