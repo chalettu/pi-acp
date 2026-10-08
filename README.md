@@ -78,9 +78,18 @@ npm run test:e2e   # full: model list, systemPrompt forwarding, tool surfacing
 
 ### MCP status
 
-Pi has no built-in MCP client. The adapter deliberately advertises no MCP transport
-and logs any `mcpServers` supplied in `session/new`; it does **not** claim those
-servers are available to the model. Adding an MCP bridge is separate work.
+Since SDK 1.0.4 the adapter registers Pi's built-in MCP client (and the `codemode`
+tool) via the resource loader's `extensionFactories`. MCP servers configured in the
+user's pi settings (`~/.pi/agent/mcp.json`) connect at session start and their tools
+are reachable through codemode (default exposure). The adapter still advertises no
+ACP MCP transport and logs — rather than forwards — any `mcpServers` supplied in
+`session/new`; it does **not** claim host-supplied servers are available to the
+model. Bridging host-supplied servers is separate work.
+
+The `codemode` tool registers **inactive**; it activates for a session only when the
+settings `defaultTools` includes `+codemode` (or the host passes `--tools`). The
+adapter logs `session.getActiveToolNames()` after binding as the activation
+diagnostic.
 
 ## Architecture
 

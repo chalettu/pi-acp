@@ -9,8 +9,9 @@
   },
   "scripts": {
     "start": "node pi-acp.mjs",
-    "test": "node test/smoke.mjs",
+    "test": "node test/smoke.mjs && node test/codemode.mjs",
     "test:lifecycle": "node test/lifecycle.mjs",
+    "test:codemode": "node test/codemode.mjs",
     "test:live": "node test/live-e2e.mjs",
     "test:e2e": "node test/e2e.mjs"
   },
@@ -24,6 +25,6 @@
     "agent"
   ],
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.83.0"
+    "@earendil-works/pi-coding-agent": "1.0.4"
   }
 }
