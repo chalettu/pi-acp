@@ -41,15 +41,22 @@ import { spawn } from "node:child_process";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
-import { mkdirSync, writeFileSync, rmSync, mkdtempSync, copyFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, mkdtempSync, copyFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-function createHermeticAgentDir(defaultTools, personaProfile = null) {
+function createHermeticAgentDir(defaultTools, personaProfile = null, realPackage = false) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-acp-codemode-"));
 	mkdirSync(dir, { recursive: true });
 	const settings = { defaultTools };
+	if (realPackage) {
+		// The REAL live persona mechanism: pinned pi-open-agents. The SDK's
+		// package manager installs it into <agentDir>/npm (hermetic temp dir —
+		// the user's real agent dir is never touched) and its extension runs
+		// the real applyTools policy path in session_start.
+		settings.packages = ["npm:pi-open-agents@0.1.22"];
+	}
 	writeFileSync(join(dir, "settings.json"), JSON.stringify(settings, null, 2) + "\n");
 	if (personaProfile) {
 		// Persona-filter scenarios: install the mirror fixture of the live
@@ -59,6 +66,8 @@ function createHermeticAgentDir(defaultTools, personaProfile = null) {
 			join(here, "fixtures", "persona-filter-fixture.js"),
 			join(dir, "extensions", "persona-filter-fixture.js"),
 		);
+	}
+	if (personaProfile || realPackage) {
 		mkdirSync(join(dir, "agents"), { recursive: true });
 		writeFileSync(
 			join(dir, "agents", "persona-permit.md"),
@@ -68,23 +77,38 @@ function createHermeticAgentDir(defaultTools, personaProfile = null) {
 			join(dir, "agents", "persona-strict.md"),
 			"---\nname: persona-strict\ntools: read\n---\n\nstrict persona\n",
 		);
+		writeFileSync(
+			join(dir, "agents", "persona-open.md"),
+			"---\nname: persona-open\n---\n\nopen persona (no tools field)\n",
+		);
 	}
 	return dir;
 }
 
-function runAdapter({ defaultTools, agentProfile = null }) {
-	const tempAgentDir = createHermeticAgentDir(defaultTools, agentProfile);
+function runAdapter({ defaultTools, agentProfile = null, realPackage = false }) {
+	const tempAgentDir = createHermeticAgentDir(defaultTools, agentProfile, realPackage);
 	const tempProject = mkdtempSync(join(tmpdir(), "pi-acp-codemode-proj-"));
 	const env = { ...process.env };
 	delete env.PI_ACP_TEST_CWD;
 	delete env.PI_ACP_TEST_SESSION_DIR;
 	delete env.PI_TRUST_STORE;
+	// When run under `npm test`, the child would inherit the outer npm's
+	// lifecycle/config env (npm_config_*, npm_lifecycle_*); strip it so the
+	// inner `npm install` (real-package scenarios) behaves identically to a
+	// bare launch.
+	for (const key of Object.keys(env)) {
+		if (key.startsWith("npm_") || key.startsWith("NPM_") || key === "INIT_CWD") delete env[key];
+	}
 	if (agentProfile === null) {
 		delete env.AGENT_PROFILE;
 	} else {
 		env.AGENT_PROFILE = agentProfile;
 	}
 	env.PI_CODING_AGENT_DIR = tempAgentDir;
+	if (realPackage) {
+		// Prefer the local npm cache so the pinned install stays hermetic.
+		env.npm_config_prefer_offline = "true";
+	}
 
 	const child = spawn("node", [resolve(here, "..", "pi-acp.mjs")], {
 		stdio: ["pipe", "pipe", "pipe"],
@@ -97,7 +121,17 @@ function runAdapter({ defaultTools, agentProfile = null }) {
 	child.stderr.on("data", (d) => (stderr += d));
 
 	rl.on("line", (line) => {
-		const message = JSON.parse(line);
+		// Tolerate out-of-band stdout: when the SDK installs a missing npm
+		// package (fresh agent dir), its npm child inherits the adapter's
+		// stdout (SDK spawnCommand uses stdio "inherit" unless the host has
+		// taken over stdout), so "added 1 package..." lines can interleave with
+		// NDJSON. A conforming host skips unparseable lines rather than dying.
+		let message;
+		try {
+			message = JSON.parse(line);
+		} catch {
+			return;
+		}
 		const resolveFn = pending.get(message.id);
 		if (resolveFn) {
 			pending.delete(message.id);
@@ -275,6 +309,126 @@ let failures = 0;
 		await new Promise((r) => child.once("exit", r));
 		rmSync(tempAgentDir, { recursive: true, force: true });
 		rmSync(tempProject, { recursive: true, force: true });
+	}
+}
+
+// ── Real-package integration (pinned pi-open-agents 0.1.22) ─────────────
+// Scenarios 1-4 above use a copied filter (fast characterization; an upstream
+// filter change cannot fail them). This section runs the actual live persona
+// package through the SDK package manager, so upstream changes DO fail it.
+// Exact active-set assertions after bind:
+//
+//   settings [read] × persona-strict → the real filter's setActiveTools
+//   RE-ACTIVATES codemode even though the settings never enabled +codemode;
+//   builtins are trimmed to {read}.
+//   settings [read] × persona-open   → ALL builtins re-activated (the no-tools
+//   case calls setActiveTools(ALL)), including powershell.
+//   settings [read] × no profile     → control: codemode stays inactive; the
+//   package's own tools (set_agent/search_agents/subagent) are the only
+//   additions to the baseline.
+//
+// A persona file alone can therefore activate a globally-disabled tool. The
+// assertions pin the observed (real) behavior so any change to the package or
+// SDK filter semantics fails loudly here.
+{
+	const realPackageScenarios = [
+		{
+			label: "R1 settings [+codemode] × persona-permit",
+			defaultTools: ["+codemode"],
+			agentProfile: "persona-permit",
+			expected: ["bash", "codemode", "read", "search_agents", "set_agent", "subagent"],
+		},
+		{
+			label: "R2 settings [+codemode] × persona-strict",
+			defaultTools: ["+codemode"],
+			agentProfile: "persona-strict",
+			expected: ["codemode", "read", "search_agents", "set_agent", "subagent"],
+		},
+		{
+			label: "R3 settings [read] × persona-permit (no +codemode in settings)",
+			defaultTools: ["read"],
+			agentProfile: "persona-permit",
+			expected: ["bash", "codemode", "read", "search_agents", "set_agent", "subagent"],
+		},
+		{
+			label: "R4 settings [read] × persona-strict (no +codemode in settings)",
+			defaultTools: ["read"],
+			agentProfile: "persona-strict",
+			expected: ["codemode", "read", "search_agents", "set_agent", "subagent"],
+		},
+		{
+			label: "R5 settings [read] × persona-open (no tools field → setActiveTools(ALL))",
+			defaultTools: ["read"],
+			agentProfile: "persona-open",
+			expected: [
+				"bash",
+				"codemode",
+				"edit",
+				"find",
+				"grep",
+				"ls",
+				"powershell",
+				"read",
+				"search_agents",
+				"set_agent",
+				"subagent",
+				"write",
+			],
+		},
+		{
+			label: "R6 settings [read] × no profile (control: real package present)",
+			defaultTools: ["read"],
+			agentProfile: null,
+			expected: ["read", "search_agents", "set_agent", "subagent"],
+		},
+	];
+	for (const scenario of realPackageScenarios) {
+		const { child, request, getStderr, tempAgentDir, tempProject } = runAdapter({
+			defaultTools: scenario.defaultTools,
+			agentProfile: scenario.agentProfile,
+			realPackage: true,
+		});
+		try {
+			const init = await request("initialize", {
+				protocolVersion: 2,
+				clientCapabilities: {},
+				clientInfo: { name: "real-package" },
+			});
+			assert.equal(init.error, undefined, "initialize must succeed");
+			const created = await request("session/new", { cwd: tempProject, mcpServers: [] });
+			assert.equal(created.error, undefined, "session/new must succeed");
+
+			const names = activeToolNames(getStderr());
+			const actual = [...names].sort();
+			const expected = [...scenario.expected].sort();
+			let installedVersion = null;
+			try {
+				const pkg = JSON.parse(
+					readFileSync(
+						join(tempAgentDir, "npm", "node_modules", "pi-open-agents", "package.json"),
+						"utf8",
+					),
+				);
+				installedVersion = pkg.version;
+			} catch {
+				/* asserted below */
+			}
+			const packageLoaded =
+				installedVersion === "0.1.22" &&
+				names.includes("set_agent") &&
+				names.includes("search_agents") &&
+				names.includes("subagent");
+			const pass = packageLoaded && JSON.stringify(actual) === JSON.stringify(expected);
+			console.log(
+				`${scenario.label} → active: "${names.join(", ")}": ${pass ? "PASS ✓" : `FAIL ✗ (expected "${expected.join(", ")}", package ${installedVersion ?? "not installed"})`}`,
+			);
+			if (!pass) failures++;
+		} finally {
+			child.stdin.end();
+			await new Promise((r) => child.once("exit", r));
+			rmSync(tempAgentDir, { recursive: true, force: true });
+			rmSync(tempProject, { recursive: true, force: true });
+		}
 	}
 }
 
