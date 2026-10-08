@@ -97,8 +97,15 @@ trims builtins to the named set, while non-builtin tools — inline SDK extensio
 like `codemode`, user extensions, and MCP tools — are kept unconditionally. A
 persona therefore cannot deactivate `codemode`; excluding a non-builtin tool
 requires the SDK's `allowedToolNames` gate (`createAgentSession` `tools` /
-`noTools`), not the persona file. `test/codemode.mjs` scenarios ③/④ cover both
-directions against a fixture mirroring the pi-open-agents filter.
+`noTools`), not the persona file. The reverse is also true and is the operative
+least-privilege boundary: pi-open-agents calls `setActiveTools(...)` during
+`session_start`, so a restrictive persona (or even a persona with **no** `tools:`
+field, which activates ALL registered tools) re-activates `codemode` for the
+session **even when the settings never enabled `+codemode`** — the persona file
+cannot keep a globally-disabled tool disabled. `test/codemode.mjs` proves both
+directions against a fixture mirroring the pi-open-agents filter (scenarios ③/④)
+and against the **real pinned pi-open-agents 0.1.22** package (R1–R6, exact
+active-set assertions through the SDK package manager).
 
 ## Architecture
 
