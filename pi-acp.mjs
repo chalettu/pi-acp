@@ -6,7 +6,9 @@
  *
  * Transport: NDJSON over stdio — one JSON-RPC 2.0 message per line.
  *   stdin  : Buzz(host) → adapter   requests + notifications
- *   stdout : adapter → Buzz(host)   responses + session/update notifications
+ *   stdout : adapter → Buzz(host)   responses + session/update notifications —
+ *            protocol ONLY. The adapter takes over the SDK output-guard at
+ *            startup (see below) so package-install output routes to stderr.
  *   stderr : diagnostic log ONLY (never the wire)
  *
  * Buzz spawns this binary, then drives it with:
@@ -39,8 +41,46 @@ import {
 import { randomUUID } from "node:crypto";
 
 // ── ACP wire helpers ──────────────────────────────────────────────────────
-const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 const log = (...a) => process.stderr.write(`[pi-acp] ${a.join(" ")}\n`);
+
+// stdout isolation — the SDK's own output guard, the supported host
+// integration for its spawnCommand stdout branch (package-manager.js):
+//   stdio: isStdoutTakenOver() ? ["ignore", 2, 2] : "inherit"
+// takeOverStdout() routes every in-process stdout write to stderr AND flips
+// that branch, so the npm child the SDK spawns for a missing package install
+// (a fresh agent dir triggers it during session/new) inherits the parent's
+// STDERR fd — install diagnostics land on the diagnostics channel, never on
+// the protocol wire. Protocol messages must then use writeRawStdout(): the
+// pre-takeover raw write, chained through an ordered tail.
+//
+// dist/core/output-guard.js is not in the SDK package's exports map, so it is
+// imported by file URL derived from the package's own main entry (its exports
+// "." — the same file this adapter imports its API from, resolved with the
+// ESM import condition): the same file (and thus the same module instance
+// and internal state) that the SDK's package-manager.js imports via its
+// relative path. If the SDK ever restructures that path the import fails:
+// we fall back to the previous behavior with a loud warning, and
+// test/codemode.mjs's strict-JSON stdout check fails loudly, so the
+// regression cannot hide.
+let outputGuard = null;
+try {
+	const sdkMain = import.meta.resolve("@earendil-works/pi-coding-agent");
+	const guardModule = await import(new URL("core/output-guard.js", sdkMain).href);
+	guardModule.takeOverStdout();
+	outputGuard = guardModule;
+} catch (err) {
+	outputGuard = null;
+	log(
+		"WARNING: SDK output-guard takeover unavailable — stdout is NOT isolated; package install output may interleave with the protocol stream:",
+		err?.message || err,
+	);
+}
+
+const send = (msg) => {
+	const line = JSON.stringify(msg) + "\n";
+	if (outputGuard?.writeRawStdout) outputGuard.writeRawStdout(line);
+	else process.stdout.write(line);
+};
 const ok = (id, result = {}) => send({ jsonrpc: "2.0", id, result });
 const fail = (id, code, message) =>
 	send({ jsonrpc: "2.0", id, error: { code, message } });
@@ -801,6 +841,13 @@ rl.on("close", async () => {
 		try {
 			s.unsubscribe?.();
 			s.session.dispose();
+		} catch {}
+	}
+	// Drain the ordered raw-stdout write tail so no pending protocol message
+	// is lost at shutdown.
+	if (outputGuard?.flushRawStdout) {
+		try {
+			await outputGuard.flushRawStdout();
 		} catch {}
 	}
 	process.exit(0);
