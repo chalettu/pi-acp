@@ -17,6 +17,21 @@
 //      proves activation is driven by the settings entry, not registration.
 //      (SDK: the settings defaultTools array replaces the built-in default
 //      tool list; codemode registers with defaultActive:false.)
+//   3. AGENT_PROFILE=persona-permit (tools: read, bash, codemode) with the
+//      persona-filter fixture (a faithful mirror of pi-open-agents 0.1.22
+//      applyTools) → builtin whitelist trims grep/find/ls/powershell; read,
+//      bash and codemode stay active. Proves the persona filter actually ran
+//      AND that a persona permitting codemode keeps it usable.
+//   4. AGENT_PROFILE=persona-strict (tools: read) → the whitelist trims
+//      builtin tools to {read}, but codemode (sourceInfo.source = "inline",
+//      registered by the SDK built-in extension factory) is KEPT: the
+//      pi-open-agents gate only restricts builtin-sourced tools. This is the
+//      real least-privilege boundary of the live persona mechanism — a
+//      restrictive persona whitelist CANNOT deactivate codemode. Excluding
+//      a non-builtin tool requires the SDK's allowedToolNames gate
+//      (createAgentSession tools/noTools), not the persona file. The test
+//      asserts the observed (real) behavior so any future change to the
+//      filter semantics is caught here.
 //
 // Hermeticity mirrors test/lifecycle.mjs: every scenario gets a fresh
 // mkdtemp agent dir and a plain temp project cwd; the test never touches the
@@ -26,27 +41,49 @@ import { spawn } from "node:child_process";
 import * as readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
-import { mkdirSync, writeFileSync, rmSync, mkdtempSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, mkdtempSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-function createHermeticAgentDir(defaultTools) {
+function createHermeticAgentDir(defaultTools, personaProfile = null) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-acp-codemode-"));
 	mkdirSync(dir, { recursive: true });
 	const settings = { defaultTools };
 	writeFileSync(join(dir, "settings.json"), JSON.stringify(settings, null, 2) + "\n");
+	if (personaProfile) {
+		// Persona-filter scenarios: install the mirror fixture of the live
+		// pi-open-agents tool filter plus the persona .md files it reads.
+		mkdirSync(join(dir, "extensions"), { recursive: true });
+		copyFileSync(
+			join(here, "fixtures", "persona-filter-fixture.js"),
+			join(dir, "extensions", "persona-filter-fixture.js"),
+		);
+		mkdirSync(join(dir, "agents"), { recursive: true });
+		writeFileSync(
+			join(dir, "agents", "persona-permit.md"),
+			"---\nname: persona-permit\ntools: read, bash, codemode\n---\n\npermitting persona\n",
+		);
+		writeFileSync(
+			join(dir, "agents", "persona-strict.md"),
+			"---\nname: persona-strict\ntools: read\n---\n\nstrict persona\n",
+		);
+	}
 	return dir;
 }
 
-function runAdapter({ defaultTools }) {
-	const tempAgentDir = createHermeticAgentDir(defaultTools);
+function runAdapter({ defaultTools, agentProfile = null }) {
+	const tempAgentDir = createHermeticAgentDir(defaultTools, agentProfile);
 	const tempProject = mkdtempSync(join(tmpdir(), "pi-acp-codemode-proj-"));
 	const env = { ...process.env };
 	delete env.PI_ACP_TEST_CWD;
 	delete env.PI_ACP_TEST_SESSION_DIR;
 	delete env.PI_TRUST_STORE;
-	delete env.AGENT_PROFILE;
+	if (agentProfile === null) {
+		delete env.AGENT_PROFILE;
+	} else {
+		env.AGENT_PROFILE = agentProfile;
+	}
 	env.PI_CODING_AGENT_DIR = tempAgentDir;
 
 	const child = spawn("node", [resolve(here, "..", "pi-acp.mjs")], {
@@ -89,6 +126,11 @@ function runAdapter({ defaultTools }) {
 function activeToolsLine(stderr) {
 	const match = stderr.split("\n").find((l) => l.includes("active tools:"));
 	return match ? match.split("active tools:")[1].trim() : null;
+}
+
+function activeToolNames(stderr) {
+	const line = activeToolsLine(stderr);
+	return line ? line.split(/,\s*/).filter(Boolean) : [];
 }
 
 let failures = 0;
@@ -149,6 +191,83 @@ let failures = 0;
 		const pass = readActive && codemodeInactive;
 		console.log(
 			`② defaultTools [read] → active tools: "${active ?? "(missing)"}": ${pass ? "PASS ✓ (read active, codemode correctly inactive)" : "FAIL ✗"}`,
+		);
+		if (!pass) failures++;
+	} finally {
+		child.stdin.end();
+		await new Promise((r) => child.once("exit", r));
+		rmSync(tempAgentDir, { recursive: true, force: true });
+		rmSync(tempProject, { recursive: true, force: true });
+	}
+}
+
+// ── Scenario 3: persona permitting codemode (global +codemode enabled) ──────
+// The persona-filter fixture runs pi-open-agents' real filter in session_start
+// and trims builtin tools to the persona whitelist; codemode (inline) is kept
+// unconditionally. The whitelist trimming is the proof the persona gate ran.
+{
+	const { child, request, getStderr, tempAgentDir, tempProject } = runAdapter({
+		defaultTools: ["+codemode"],
+		agentProfile: "persona-permit",
+	});
+	try {
+		const init = await request("initialize", {
+			protocolVersion: 2,
+			clientCapabilities: {},
+			clientInfo: { name: "persona-permit" },
+		});
+		assert.equal(init.error, undefined, "initialize must succeed");
+
+		const created = await request("session/new", { cwd: tempProject, mcpServers: [] });
+		assert.equal(created.error, undefined, "session/new must succeed");
+
+		const names = activeToolNames(getStderr());
+		const filterRan = getStderr().includes("[persona-fixture] profile=persona-permit");
+		const readActive = names.includes("read");
+		const bashActive = names.includes("bash");
+		const codemodeActive = names.includes("codemode");
+		const builtinTrimmed = !names.includes("grep") && !names.includes("ls");
+		const pass = filterRan && readActive && bashActive && codemodeActive && builtinTrimmed;
+		console.log(
+			`③ persona-permit (tools: read, bash, codemode) → active: "${names.join(", ")}": ${pass ? "PASS ✓ (whitelist ran; codemode kept active)" : "FAIL ✗"}`,
+		);
+		if (!pass) failures++;
+	} finally {
+		child.stdin.end();
+		await new Promise((r) => child.once("exit", r));
+		rmSync(tempAgentDir, { recursive: true, force: true });
+		rmSync(tempProject, { recursive: true, force: true });
+	}
+}
+
+// ── Scenario 4: restrictive persona (tools: read) — the real gate boundary ──
+// pi-open-agents' whitelist only restricts builtin-sourced tools; codemode
+// (source: "inline") survives it. Assert the OBSERVED real behavior — and if
+// the SDK/extension filter semantics ever change, this scenario fails loudly.
+{
+	const { child, request, getStderr, tempAgentDir, tempProject } = runAdapter({
+		defaultTools: ["+codemode"],
+		agentProfile: "persona-strict",
+	});
+	try {
+		const init = await request("initialize", {
+			protocolVersion: 2,
+			clientCapabilities: {},
+			clientInfo: { name: "persona-strict" },
+		});
+		assert.equal(init.error, undefined, "initialize must succeed");
+
+		const created = await request("session/new", { cwd: tempProject, mcpServers: [] });
+		assert.equal(created.error, undefined, "session/new must succeed");
+
+		const names = activeToolNames(getStderr());
+		const filterRan = getStderr().includes("[persona-fixture] profile=persona-strict");
+		const readActive = names.includes("read");
+		const builtinTrimmed = !names.includes("bash") && !names.includes("grep");
+		const codemodeKept = names.includes("codemode");
+		const pass = filterRan && readActive && builtinTrimmed && codemodeKept;
+		console.log(
+			`④ persona-strict (tools: read) → active: "${names.join(", ")}": ${pass ? "PASS ✓ (builtin whitelist trimmed; codemode kept — inline tools are outside the persona whitelist gate)" : "FAIL ✗"}`,
 		);
 		if (!pass) failures++;
 	} finally {
