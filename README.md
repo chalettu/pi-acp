@@ -91,6 +91,15 @@ settings `defaultTools` includes `+codemode` (or the host passes `--tools`). The
 adapter logs `session.getActiveToolNames()` after binding as the activation
 diagnostic.
 
+Persona tool filtering (the `AGENT_PROFILE` flag read by pi-open-agents during
+`session_start`) restricts **builtin** tools only: a persona `tools:` whitelist
+trims builtins to the named set, while non-builtin tools — inline SDK extensions
+like `codemode`, user extensions, and MCP tools — are kept unconditionally. A
+persona therefore cannot deactivate `codemode`; excluding a non-builtin tool
+requires the SDK's `allowedToolNames` gate (`createAgentSession` `tools` /
+`noTools`), not the persona file. `test/codemode.mjs` scenarios ③/④ cover both
+directions against a fixture mirroring the pi-open-agents filter.
+
 ## Architecture
 
 This is a **generic ACP adapter**, not a Buzz plugin. It speaks the standard
