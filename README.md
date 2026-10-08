@@ -102,10 +102,31 @@ least-privilege boundary: pi-open-agents calls `setActiveTools(...)` during
 `session_start`, so a restrictive persona (or even a persona with **no** `tools:`
 field, which activates ALL registered tools) re-activates `codemode` for the
 session **even when the settings never enabled `+codemode`** — the persona file
-cannot keep a globally-disabled tool disabled. `test/codemode.mjs` proves both
-directions against a fixture mirroring the pi-open-agents filter (scenarios ③/④)
-and against the **real pinned pi-open-agents 0.1.22** package (R1–R6, exact
-active-set assertions through the SDK package manager).
+cannot keep a globally-disabled tool disabled. `codemode` additionally exposes
+`models.*` (the model catalog) beyond what `mcp`/`mcpScript` grant, plus
+in-script orchestration of other tools — nested calls run the normal tool
+pipeline with the same permission checks, not a bypass. `test/codemode.mjs`
+proves both directions against a fixture mirroring the pi-open-agents filter
+(scenarios ③/④) and against the **real pinned pi-open-agents 0.1.22** package
+(R1–R6): the mirror fixture is asserted ABSENT from those scenarios so the
+real package's `applyTools` alone produced each exact active set, the set is
+re-verified after a lifecycle refresh (`/reset` full re-bind re-runs the
+package's `session_start`), and every scenario asserts stdout is protocol-JSON
+only.
+
+### Transport guarantee
+
+stdout is reserved for the ACP protocol. At startup the adapter takes over the
+SDK's own output guard (the supported host integration for the SDK's child
+`spawnCommand` branch `stdio: isStdoutTakenOver() ? ["ignore", 2, 2] :
+"inherit"`): every in-process stdout write is routed to stderr, and the `npm
+install` child the SDK spawns for a missing package install (a fresh agent
+dir triggers this during `session/new`) inherits the parent's **stderr** fd,
+so install diagnostics land on the diagnostics channel — never on the wire.
+Protocol messages are written through the guard's ordered `writeRawStdout`.
+The regression suite pins the contract by asserting that **every** line the
+adapter emits on stdout parses as JSON; a leaked install line fails the suite
+instead of being silently skipped by a conforming reader.
 
 ## Architecture
 
